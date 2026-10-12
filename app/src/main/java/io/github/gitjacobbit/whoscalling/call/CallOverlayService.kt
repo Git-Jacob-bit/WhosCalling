@@ -27,7 +27,11 @@ class CallOverlayService : Service() {
     private val handler = Handler(Looper.getMainLooper())
     private val telephony by lazy { getSystemService(TelephonyManager::class.java) }
     private var callback: Any? = null
+    private var listening = false
+    private var lastState = TelephonyManager.CALL_STATE_IDLE
+    private var sessionId = 0
     private var sawActiveCall = false
+    private val ringGrace = Runnable { if (!sawActiveCall) container.calls.onCallEnded(sessionId) }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -38,12 +42,19 @@ class CallOverlayService : Service() {
             buildNotification(),
             ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE,
         )
-        listenToCallState()
-        // Safety net when the call state is not observable (missing permission, OEM quirks).
-        handler.postDelayed({ container.calls.onCallEnded() }, MAX_SESSION_MS)
+        listening = listenToCallState()
     }
 
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_NOT_STICKY
+    /** Called for every call session; the service may already be running for an earlier one. */
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        sessionId = intent?.getIntExtra(EXTRA_SESSION, 0) ?: 0
+        // A call waiting during another call never goes through RINGING from IDLE.
+        sawActiveCall = lastState != TelephonyManager.CALL_STATE_IDLE
+        handler.removeCallbacks(ringGrace)
+        // The caller may hang up between screening and this point; then the phone never rings.
+        if (listening) handler.postDelayed(ringGrace, RING_GRACE_MS)
+        return START_NOT_STICKY
+    }
 
     override fun onDestroy() {
         handler.removeCallbacksAndMessages(null)
@@ -52,19 +63,20 @@ class CallOverlayService : Service() {
     }
 
     private fun onCallState(state: Int) {
+        lastState = state
         when (state) {
             TelephonyManager.CALL_STATE_RINGING -> sawActiveCall = true
             TelephonyManager.CALL_STATE_OFFHOOK -> {
                 sawActiveCall = true
-                container.calls.onCallAnswered()
+                container.calls.onCallAnswered(sessionId)
             }
             // Screening runs before the phone starts ringing, so an initial IDLE must be ignored.
-            TelephonyManager.CALL_STATE_IDLE -> if (sawActiveCall) container.calls.onCallEnded()
+            TelephonyManager.CALL_STATE_IDLE -> if (sawActiveCall) container.calls.onCallEnded(sessionId)
         }
     }
 
-    private fun listenToCallState() {
-        if (checkSelfPermission(Manifest.permission.READ_PHONE_STATE) != PackageManager.PERMISSION_GRANTED) return
+    private fun listenToCallState(): Boolean {
+        if (checkSelfPermission(Manifest.permission.READ_PHONE_STATE) != PackageManager.PERMISSION_GRANTED) return false
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             val cb = object : TelephonyCallback(), TelephonyCallback.CallStateListener {
                 override fun onCallStateChanged(state: Int) = onCallState(state)
@@ -81,6 +93,7 @@ class CallOverlayService : Service() {
             telephony.listen(listener, PhoneStateListener.LISTEN_CALL_STATE)
             callback = listener
         }
+        return true
     }
 
     @Suppress("DEPRECATION")
@@ -109,10 +122,11 @@ class CallOverlayService : Service() {
     companion object {
         private const val CHANNEL_ID = "call_identification"
         private const val NOTIFICATION_ID = 1
-        private const val MAX_SESSION_MS = 3 * 60_000L
+        private const val RING_GRACE_MS = 10_000L
+        private const val EXTRA_SESSION = "session"
 
-        fun start(context: Context) {
-            context.startForegroundService(Intent(context, CallOverlayService::class.java))
+        fun start(context: Context, sessionId: Int) {
+            context.startForegroundService(Intent(context, CallOverlayService::class.java).putExtra(EXTRA_SESSION, sessionId))
         }
 
         fun stop(context: Context) {

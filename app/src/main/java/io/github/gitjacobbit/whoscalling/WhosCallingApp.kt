@@ -34,7 +34,7 @@ class AppContainer(context: Context) {
     val analyzer = LocalAnalyzer {
         telephony?.networkCountryIso?.takeIf { it.isNotBlank() }?.uppercase() ?: "PL"
     }
-    val callers = CallerRepository(database.numberDao(), settings, openAi, analyzer)
+    val callers = CallerRepository(database, settings, openAi, analyzer)
     val overlay = OverlayController(context)
     val calls = CallSessionManager(context, appScope, callers, overlay)
 }

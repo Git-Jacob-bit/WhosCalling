@@ -3,7 +3,8 @@ package io.github.gitjacobbit.whoscalling.domain
 import io.github.gitjacobbit.whoscalling.data.ai.AiVerdict
 import io.github.gitjacobbit.whoscalling.data.ai.OpenAiClient
 import io.github.gitjacobbit.whoscalling.data.db.CallLogEntity
-import io.github.gitjacobbit.whoscalling.data.db.NumberDao
+import androidx.room.withTransaction
+import io.github.gitjacobbit.whoscalling.data.db.AppDatabase
 import io.github.gitjacobbit.whoscalling.data.db.PhoneNumberEntity
 import io.github.gitjacobbit.whoscalling.data.settings.SettingsRepository
 import kotlinx.coroutines.CancellationException
@@ -23,11 +24,13 @@ data class LookupState(
 )
 
 class CallerRepository(
-    private val dao: NumberDao,
+    private val database: AppDatabase,
     private val settings: SettingsRepository,
     private val ai: OpenAiClient,
     private val analyzer: LocalAnalyzer,
 ) {
+    private val dao = database.numberDao()
+
     fun normalize(raw: String): String = analyzer.analyze(raw).e164
 
     /** Decides in the screening service (≤5 s budget) whether to block, using only the local database. */
@@ -36,14 +39,20 @@ class CallerRepository(
         return when (entry.userOverride) {
             UserOverride.SPAM -> true
             UserOverride.SAFE -> false
-            null -> settings.current().let { it.autoBlock && entry.aiChecked && entry.score >= it.autoBlockThreshold }
+            // An expired AI verdict must let the call through, otherwise it would never get refreshed.
+            null -> settings.current().let {
+                it.autoBlock && entry.aiChecked && entry.isFresh(it.cacheDays) && entry.score >= it.autoBlockThreshold
+            }
         }
     }
 
     suspend fun registerCall(e164: String, blocked: Boolean) {
         val now = System.currentTimeMillis()
-        dao.insertCall(CallLogEntity(e164 = e164, timestamp = now, blocked = blocked))
-        dao.registerCall(e164, now)
+        // Paired with the transactional row creation below so each call is counted exactly once.
+        database.withTransaction {
+            dao.insertCall(CallLogEntity(e164 = e164, timestamp = now, blocked = blocked))
+            dao.registerCall(e164, now)
+        }
     }
 
     /** Emits the cached/local state immediately, then the AI result when a refresh is needed. */
@@ -51,13 +60,11 @@ class CallerRepository(
         val local = analyzer.analyze(raw)
         val cached = dao.get(local.e164)
         val prefs = settings.current()
-        val maxAge = TimeUnit.DAYS.toMillis(prefs.cacheDays.toLong())
-        val fresh = cached != null && cached.aiChecked &&
-            System.currentTimeMillis() - cached.checkedAt < maxAge
+        val fresh = cached != null && cached.aiChecked && cached.isFresh(prefs.cacheDays)
         val apiKey = settings.apiKey()
 
         if (!force && (fresh || cached?.userOverride != null) || apiKey == null) {
-            val entry = cached ?: withCallStats(localEntry(local), null).also { dao.upsert(it) }
+            val entry = cached ?: saveLocal(local)
             val error = if (apiKey == null && !fresh) "Brak klucza API – tylko analiza lokalna" else null
             emit(LookupState(local, entry, loading = false, error = error, fromCache = cached != null))
             return@flow
@@ -66,12 +73,10 @@ class CallerRepository(
         emit(LookupState(local, cached, loading = true))
         try {
             val verdict = withTimeout(AI_TIMEOUT_MS) { ai.investigate(apiKey, prefs.model, local.e164, local.describe()) }
-            val entry = withCallStats(verdict.toEntity(local.e164, cached), cached)
-            dao.upsert(entry)
-            emit(LookupState(local, entry, loading = false))
+            emit(LookupState(local, saveAi(local, verdict), loading = false))
         } catch (e: Exception) {
             if (e is CancellationException && e !is TimeoutCancellationException) throw e
-            val entry = cached ?: withCallStats(localEntry(local), null).also { dao.upsert(it) }
+            val entry = cached ?: saveLocal(local)
             val message = if (e is TimeoutCancellationException) "AI nie odpowiedziało na czas" else e.message
             emit(LookupState(local, entry, loading = false, error = message ?: "Błąd analizy"))
         }
@@ -79,10 +84,31 @@ class CallerRepository(
 
     suspend fun setOverride(e164: String, override: UserOverride?) = dao.setOverride(e164, override?.name)
 
-    /** A new entry is created after the screening service logged the call, so take counters from the call log. */
-    private suspend fun withCallStats(entry: PhoneNumberEntity, previous: PhoneNumberEntity?) =
-        if (previous != null) entry
-        else entry.copy(callCount = dao.countCalls(entry.e164), lastCallAt = dao.lastCallAt(entry.e164))
+    private fun PhoneNumberEntity.isFresh(cacheDays: Int) =
+        System.currentTimeMillis() - checkedAt < TimeUnit.DAYS.toMillis(cacheDays.toLong())
+
+    /**
+     * Rows are never rewritten wholesale: the user may rate the number while the AI request runs.
+     * A new row takes its counters from the call log, which the screening service has already written.
+     */
+    private suspend fun saveLocal(local: LocalInfo): PhoneNumberEntity {
+        insertWithCallStats(localEntry(local))
+        return dao.get(local.e164)!!
+    }
+
+    private suspend fun saveAi(local: LocalInfo, verdict: AiVerdict): PhoneNumberEntity {
+        val result = verdict.toEntity(local.e164)
+        insertWithCallStats(result)
+        dao.updateAiResult(
+            result.e164, result.verdict, result.score, result.category, result.owner,
+            result.summary, result.sources, result.checkedAt,
+        )
+        return dao.get(local.e164)!!
+    }
+
+    private suspend fun insertWithCallStats(entry: PhoneNumberEntity) = database.withTransaction {
+        dao.insertIfAbsent(entry.copy(callCount = dao.countCalls(entry.e164), lastCallAt = dao.lastCallAt(entry.e164)))
+    }
 
     private fun localEntry(local: LocalInfo) = PhoneNumberEntity(
         e164 = local.e164,
@@ -101,7 +127,7 @@ class CallerRepository(
         aiChecked = false,
     )
 
-    private fun AiVerdict.toEntity(e164: String, previous: PhoneNumberEntity?) = PhoneNumberEntity(
+    private fun AiVerdict.toEntity(e164: String) = PhoneNumberEntity(
         e164 = e164,
         verdict = runCatching { Verdict.valueOf(verdict.uppercase()) }.getOrDefault(Verdict.UNKNOWN),
         score = score.coerceIn(0, 100),
@@ -111,13 +137,10 @@ class CallerRepository(
         sources = sources.take(5),
         checkedAt = System.currentTimeMillis(),
         aiChecked = true,
-        callCount = previous?.callCount ?: 0,
-        lastCallAt = previous?.lastCallAt,
-        userOverride = previous?.userOverride,
-        userNote = previous?.userNote,
     )
 
     private companion object {
+        // Slightly above the HTTP call timeout so the client reports its own error first.
         const val AI_TIMEOUT_MS = 45_000L
     }
 }

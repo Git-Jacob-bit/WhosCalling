@@ -2,6 +2,7 @@ package io.github.gitjacobbit.whoscalling.call
 
 import android.telecom.Call
 import android.telecom.CallScreeningService
+import android.util.Log
 import io.github.gitjacobbit.whoscalling.container
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
@@ -19,8 +20,10 @@ class WhosCallingScreeningService : CallScreeningService() {
 
         container.appScope.launch {
             val e164 = raw?.let(container.callers::normalize)
-            // The system gives us ~5 s to answer; the cache lookup is a single indexed query.
-            val block = e164 != null && withTimeoutOrNull(2_000) { container.callers.shouldBlock(e164) } == true
+            // The system gives us ~5 s to answer. Any failure fails open: a missed block beats a lost call.
+            val block = e164 != null && runCatching {
+                withTimeoutOrNull(2_000) { container.callers.shouldBlock(e164) } == true
+            }.onFailure { Log.e(TAG, "Block decision failed", it) }.getOrDefault(false)
             respondToCall(
                 details,
                 CallResponse.Builder()
@@ -29,8 +32,16 @@ class WhosCallingScreeningService : CallScreeningService() {
                     .setSkipNotification(block)
                     .build(),
             )
-            if (e164 != null) container.callers.registerCall(e164, blocked = block)
+            // Logged before the lookup starts so a new number's row picks up this call in its counter.
+            if (e164 != null) {
+                runCatching { container.callers.registerCall(e164, blocked = block) }
+                    .onFailure { Log.e(TAG, "Call log write failed", it) }
+            }
             if (!block) container.calls.onIncomingCall(raw)
         }
+    }
+
+    private companion object {
+        const val TAG = "Screening"
     }
 }

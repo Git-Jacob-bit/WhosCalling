@@ -1,6 +1,7 @@
 package io.github.gitjacobbit.whoscalling.data.ai
 
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
@@ -15,12 +16,17 @@ import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonArray
 import kotlinx.serialization.json.putJsonObject
+import okhttp3.Call
+import okhttp3.Callback
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.Response
 import java.io.IOException
 import java.util.concurrent.TimeUnit
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
 
 @Serializable
 data class AiVerdict(
@@ -37,7 +43,8 @@ class OpenAiException(message: String) : IOException(message)
 class OpenAiClient(
     private val http: OkHttpClient = OkHttpClient.Builder()
         .connectTimeout(10, TimeUnit.SECONDS)
-        .readTimeout(60, TimeUnit.SECONDS)
+        .readTimeout(40, TimeUnit.SECONDS)
+        .callTimeout(40, TimeUnit.SECONDS)
         .build(),
 ) {
     private val json = Json { ignoreUnknownKeys = true }
@@ -49,9 +56,8 @@ class OpenAiClient(
                 .url("$BASE_URL/models")
                 .header("Authorization", "Bearer $apiKey")
                 .build()
-            http.newCall(request).execute().use { response ->
-                if (!response.isSuccessful) throw OpenAiException(errorMessage(response.code, response.body?.string()))
-            }
+            val (code, raw) = http.newCall(request).await()
+            if (code !in 200..299) throw OpenAiException(errorMessage(code, raw))
         }
     }
 
@@ -82,11 +88,9 @@ class OpenAiClient(
                 .post(body.toString().toRequestBody("application/json".toMediaType()))
                 .build()
 
-            http.newCall(request).execute().use { response ->
-                val raw = response.body?.string()
-                if (!response.isSuccessful) throw OpenAiException(errorMessage(response.code, raw))
-                json.decodeFromString(AiVerdict.serializer(), extractOutputText(raw ?: ""))
-            }
+            val (code, raw) = http.newCall(request).await()
+            if (code !in 200..299) throw OpenAiException(errorMessage(code, raw))
+            json.decodeFromString(AiVerdict.serializer(), extractOutputText(raw))
         }
 
     private fun extractOutputText(raw: String): String {
@@ -102,17 +106,32 @@ class OpenAiClient(
             ?: throw OpenAiException("Model nie zwrócił odpowiedzi tekstowej")
     }
 
-    private fun errorMessage(code: Int, raw: String?): String {
-        val apiMessage = raw?.let {
-            runCatching {
-                json.parseToJsonElement(it).jsonObject["error"]?.jsonObject?.get("message")?.jsonPrimitive?.contentOrNull
-            }.getOrNull()
-        }
+    private fun errorMessage(code: Int, raw: String): String {
+        val apiMessage = runCatching {
+            json.parseToJsonElement(raw).jsonObject["error"]?.jsonObject?.get("message")?.jsonPrimitive?.contentOrNull
+        }.getOrNull()
         return when (code) {
             401 -> "Nieprawidłowy klucz API"
             429 -> "Limit zapytań lub brak środków na koncie OpenAI"
             else -> apiMessage ?: "Błąd OpenAI ($code)"
         }
+    }
+
+    /**
+     * Unlike execute(), this aborts the HTTP request when the coroutine is cancelled or times out.
+     * The body is read inside the callback so cancellation also covers the download.
+     */
+    private suspend fun Call.await(): Pair<Int, String> = suspendCancellableCoroutine { cont ->
+        cont.invokeOnCancellation { cancel() }
+        enqueue(object : Callback {
+            override fun onResponse(call: Call, response: Response) {
+                runCatching { response.use { it.code to it.body!!.string() } }
+                    .onSuccess { cont.resume(it) }
+                    .onFailure { cont.resumeWithException(it) }
+            }
+
+            override fun onFailure(call: Call, e: IOException) = cont.resumeWithException(e)
+        })
     }
 
     private fun JsonArray?.orEmpty(): JsonArray = this ?: JsonArray(emptyList())

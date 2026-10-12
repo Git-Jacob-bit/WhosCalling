@@ -3,6 +3,7 @@ package io.github.gitjacobbit.whoscalling.overlay
 import android.content.Context
 import android.graphics.PixelFormat
 import android.view.Gravity
+import android.view.ViewTreeObserver
 import android.view.WindowManager
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -31,23 +32,29 @@ class OverlayController(context: Context) {
     private val state = MutableStateFlow<OverlayUiState?>(null)
     private var view: ComposeView? = null
     private var lifecycleOwner: OverlayLifecycleOwner? = null
+    private var drawn = false
+    private var pendingOnVisible: (() -> Unit)? = null
 
     private val params = WindowManager.LayoutParams(
         WindowManager.LayoutParams.MATCH_PARENT,
         WindowManager.LayoutParams.WRAP_CONTENT,
         WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
         WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-            WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-            WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED,
+            WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
         PixelFormat.TRANSLUCENT,
     ).apply {
         gravity = Gravity.TOP
         y = (appContext.resources.displayMetrics.heightPixels * 0.12f).toInt()
     }
 
-    fun show(initial: OverlayUiState, actions: Actions) {
+    /** [onVisible] runs once the window has drawn its first frame (immediately if it is already showing). */
+    fun show(initial: OverlayUiState, actions: Actions, onVisible: () -> Unit = {}) {
         state.value = initial
-        if (view != null) return
+        if (view != null) {
+            if (drawn) onVisible() else pendingOnVisible = onVisible
+            return
+        }
+        pendingOnVisible = onVisible
         val owner = OverlayLifecycleOwner().also { it.start() }
         val composeView = ComposeView(appContext).apply {
             setViewTreeLifecycleOwner(owner)
@@ -66,6 +73,21 @@ class OverlayController(context: Context) {
                 }
             }
         }
+        composeView.viewTreeObserver.addOnDrawListener(object : ViewTreeObserver.OnDrawListener {
+            private var fired = false
+            override fun onDraw() {
+                if (fired) return
+                fired = true
+                // Listeners cannot be removed from inside onDraw; posting also lets the frame reach the screen.
+                composeView.post {
+                    composeView.viewTreeObserver.removeOnDrawListener(this)
+                    if (view !== composeView) return@post
+                    drawn = true
+                    pendingOnVisible?.invoke()
+                    pendingOnVisible = null
+                }
+            }
+        })
         windowManager.addView(composeView, params)
         view = composeView
         lifecycleOwner = owner
@@ -80,6 +102,8 @@ class OverlayController(context: Context) {
         lifecycleOwner?.destroy()
         view = null
         lifecycleOwner = null
+        drawn = false
+        pendingOnVisible = null
         state.value = null
     }
 

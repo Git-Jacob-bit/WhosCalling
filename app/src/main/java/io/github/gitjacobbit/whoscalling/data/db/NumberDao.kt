@@ -2,8 +2,11 @@ package io.github.gitjacobbit.whoscalling.data.db
 
 import androidx.room.Dao
 import androidx.room.Insert
+import androidx.room.OnConflictStrategy
 import androidx.room.Query
 import androidx.room.Upsert
+import io.github.gitjacobbit.whoscalling.domain.CallerCategory
+import io.github.gitjacobbit.whoscalling.domain.Verdict
 import kotlinx.coroutines.flow.Flow
 
 data class CallWithNumber(
@@ -28,6 +31,22 @@ interface NumberDao {
 
     @Upsert
     suspend fun upsert(entity: PhoneNumberEntity)
+
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun insertIfAbsent(entity: PhoneNumberEntity)
+
+    /** Touches only the columns the AI owns, so user ratings and counters written meanwhile survive. */
+    @Query(
+        """
+        UPDATE numbers SET verdict = :verdict, score = :score, category = :category, owner = :owner,
+            summary = :summary, sources = :sources, checkedAt = :checkedAt, aiChecked = 1
+        WHERE e164 = :e164
+        """
+    )
+    suspend fun updateAiResult(
+        e164: String, verdict: Verdict, score: Int, category: CallerCategory, owner: String?,
+        summary: String, sources: List<String>, checkedAt: Long,
+    )
 
     @Query("UPDATE numbers SET callCount = callCount + 1, lastCallAt = :at WHERE e164 = :e164")
     suspend fun registerCall(e164: String, at: Long)
