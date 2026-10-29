@@ -6,6 +6,7 @@ import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
+import io.github.gitjacobbit.whoscalling.domain.LookupSettings
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
@@ -21,7 +22,7 @@ data class Settings(
     val onboardingDone: Boolean,
 )
 
-class SettingsRepository(private val context: Context) {
+class SettingsRepository(private val context: Context) : LookupSettings {
     private object Keys {
         val apiKey = stringPreferencesKey("api_key_enc")
         val model = stringPreferencesKey("model")
@@ -42,9 +43,9 @@ class SettingsRepository(private val context: Context) {
         )
     }
 
-    suspend fun current(): Settings = settings.first()
+    override suspend fun current(): Settings = settings.first()
 
-    suspend fun apiKey(): String? =
+    override suspend fun apiKey(): String? =
         context.dataStore.data.first()[Keys.apiKey]?.let(SecretStore::decrypt)
 
     suspend fun setApiKey(key: String?) = context.dataStore.edit { p ->

@@ -1,5 +1,6 @@
 package io.github.gitjacobbit.whoscalling.data.ai
 
+import io.github.gitjacobbit.whoscalling.domain.CallerInvestigator
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
@@ -46,7 +47,7 @@ class OpenAiClient(
         .readTimeout(40, TimeUnit.SECONDS)
         .callTimeout(40, TimeUnit.SECONDS)
         .build(),
-) {
+) : CallerInvestigator {
     private val json = Json { ignoreUnknownKeys = true }
 
     /** Cheap call used by onboarding/settings to validate a key. */
@@ -61,7 +62,7 @@ class OpenAiClient(
         }
     }
 
-    suspend fun investigate(apiKey: String, model: String, e164: String, localContext: String): AiVerdict =
+    override suspend fun investigate(apiKey: String, model: String, e164: String, localContext: String): AiVerdict =
         withContext(Dispatchers.IO) {
             val body = buildJsonObject {
                 put("model", model)
