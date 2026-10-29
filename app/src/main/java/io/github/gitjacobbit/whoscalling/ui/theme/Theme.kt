@@ -1,8 +1,10 @@
 package io.github.gitjacobbit.whoscalling.ui.theme
 
+import androidx.compose.material3.LocalContentColor
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 
 private val Colors = darkColorScheme(
     primary = Palette.Accent,
@@ -21,5 +23,8 @@ private val Colors = darkColorScheme(
 
 @Composable
 fun WhosCallingTheme(content: @Composable () -> Unit) {
-    MaterialTheme(colorScheme = Colors, content = content)
+    MaterialTheme(colorScheme = Colors) {
+        // Text outside a Surface/Scaffold would otherwise fall back to black on the dark background.
+        CompositionLocalProvider(LocalContentColor provides Palette.TextPrimary, content = content)
+    }
 }

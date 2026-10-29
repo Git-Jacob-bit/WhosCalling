@@ -1,12 +1,11 @@
 package io.github.gitjacobbit.whoscalling.domain
 
-import io.github.gitjacobbit.whoscalling.data.ai.AiVerdict
-import io.github.gitjacobbit.whoscalling.data.ai.OpenAiClient
-import io.github.gitjacobbit.whoscalling.data.db.CallLogEntity
 import androidx.room.withTransaction
+import io.github.gitjacobbit.whoscalling.data.ai.AiVerdict
 import io.github.gitjacobbit.whoscalling.data.db.AppDatabase
+import io.github.gitjacobbit.whoscalling.data.db.CallLogEntity
 import io.github.gitjacobbit.whoscalling.data.db.PhoneNumberEntity
-import io.github.gitjacobbit.whoscalling.data.settings.SettingsRepository
+import io.github.gitjacobbit.whoscalling.data.settings.Settings
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.flow.Flow
@@ -23,10 +22,21 @@ data class LookupState(
     val fromCache: Boolean = false,
 )
 
+/** The settings the lookup pipeline reads; implemented by SettingsRepository. */
+interface LookupSettings {
+    suspend fun current(): Settings
+    suspend fun apiKey(): String?
+}
+
+/** Online caller research; implemented by OpenAiClient. */
+fun interface CallerInvestigator {
+    suspend fun investigate(apiKey: String, model: String, e164: String, localContext: String): AiVerdict
+}
+
 class CallerRepository(
     private val database: AppDatabase,
-    private val settings: SettingsRepository,
-    private val ai: OpenAiClient,
+    private val settings: LookupSettings,
+    private val ai: CallerInvestigator,
     private val analyzer: LocalAnalyzer,
 ) {
     private val dao = database.numberDao()
@@ -70,13 +80,14 @@ class CallerRepository(
             return@flow
         }
 
-        emit(LookupState(local, cached, loading = true))
+        // The row must exist before the AI runs, otherwise a rating given meanwhile has nothing to update.
+        val entry = cached ?: saveLocal(local)
+        emit(LookupState(local, entry, loading = true))
         try {
             val verdict = withTimeout(AI_TIMEOUT_MS) { ai.investigate(apiKey, prefs.model, local.e164, local.describe()) }
             emit(LookupState(local, saveAi(local, verdict), loading = false))
         } catch (e: Exception) {
             if (e is CancellationException && e !is TimeoutCancellationException) throw e
-            val entry = cached ?: saveLocal(local)
             val message = if (e is TimeoutCancellationException) "AI nie odpowiedziało na czas" else e.message
             emit(LookupState(local, entry, loading = false, error = message ?: "Błąd analizy"))
         }
